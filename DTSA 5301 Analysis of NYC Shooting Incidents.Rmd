@@ -1,0 +1,705 @@
+---
+title: "DTSA 5301 - Analysis of NYC Shooting Incidents"
+author: "Matthew Dutton"
+date: "`r Sys.Date()`"
+output: 
+  html_document: default
+---
+
+```{r SETUP, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(dplyr)
+library(hms)
+library(caret)
+library(sf)
+library(viridis)
+library(knitr)
+library(treemapify)
+library(forecast)
+library(fastDummies)
+library(randomForest)
+```
+
+## Introduction
+
+The NYC OpenData *NYPD Shooting Incident (Historic)* dataset provides comprehensive data on shooting incidents recorded by the New York Police Department from 2006 to the prior year. It details incidents where firearms were discharged and injuries occurred, including: date/time, location (borough, precinct, coordinates), victim/perpetrator demographics (age, sex, race), injury severity (fatal/non-fatal), crime classification, and contextual factors (e.g. gang-related, domestic violence). This dataset empowers analysts and policymakers to analyze gun violence trends and inform data-driven public safety strategies.
+
+## Research Questions
+
+This report aims to answer the following questions:
+
+1. What is the overall trend in shooting incidents?
+2. How are shootings distributed across the Five Boroughs?
+3. When did most shootings take place??
+4. What can we learn about the people killed in these incidents?
+5. Will fatal shootings increase or decrease over the next ten years?
+6. What is the likelihood that a shooting is fatal?
+
+### Environment Setup
+
+To begin, let's import the various packages that we will need to conduct our analysis, and set a seed value so that our models are reproducible.
+
+```{r ENV_SETUP, message=FALSE, warning=FALSE}
+# Import required libraries
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(dplyr)
+library(hms)
+library(caret)
+library(sf)
+library(viridis)
+library(knitr)
+library(wordcloud)
+library(forecast)
+library(fastDummies)
+library(randomForest)
+
+# Set seed for reproducibility
+set.seed(123)
+```
+
+## Load Data
+
+Next, download the latest version of the dataset from the NYC Open Data API and read it into R as a data frame.
+
+```{r LOAD_DATA, message=FALSE, warning=FALSE}
+# Load dataset into a dataframe
+shootings <- read_csv("https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD")
+```
+
+## Inspect Data
+
+Before performing any analysis, we need to understand the structure, data types, and sample values of the dataset. This is a critical early step in any data science project.
+
+```{r INSPECT_DATA, message=FALSE, warning=FALSE}
+# Inspect dataframe
+glimpse(shootings)
+```
+
+The dataset is comprised of **28,562** observations of **21** variables. A quick review of the `glimpse()` output reveals several issues that need to be addressed - there appear to be a large number of missing values, which could skew our analysis, and some of the data types need to be modified to make features easier to work with. 
+
+## Data Cleaning & Transformation
+
+Cleaning the dataset is critical for ensuring the integrity and reliability of our analysis. First, we should check to see if there are any duplicate records in the dataset that should be removed. Let's filter out duplicates based on the `INCIDENT_KEY` values in this feature are all meant to be unique.
+
+```{r DUPLICATE_CHECK, message=FALSE, warning=FALSE}
+# Remove duplicate records
+shootings_clean <- shootings %>%
+  distinct(INCIDENT_KEY, .keep_all = TRUE)
+
+# Calculate number of duplicate records removed
+num_duplicates <- nrow(shootings) - nrow(shootings_clean)
+cat("Number of duplicate records removed:", num_duplicates, "\n")
+```
+
+In addition to removing duplicates, we need to handle all of the missing values and other anomalies. For example, there are values in the `PERP_AGE_GROUP` and `VIC_AGE_GROUP` columns that appear to be data entry typos. Since we cannot assume the intended values we will treat these anomalies like all other pieces of missing information.
+
+```{r HANDLE_ANOMALIES, message=FALSE, warning=FALSE}
+# Remove age group anomalies
+shootings_clean <- shootings_clean %>%
+  mutate(
+    PERP_AGE_GROUP = case_when(
+      PERP_AGE_GROUP %in% c("1020", "1028", "224", "940") ~ NA_character_,
+      TRUE ~ PERP_AGE_GROUP
+    ),
+    VIC_AGE_GROUP = case_when(
+      VIC_AGE_GROUP %in% c("1022") ~ NA_character_,
+      TRUE ~ VIC_AGE_GROUP
+    )
+  )
+
+# Standardize missing values as NA
+shootings_clean <- shootings_clean %>%
+  mutate(across(where(is.character), ~ na_if(., "(null)"))) %>%
+  mutate(across(where(is.character), ~ na_if(., "UNKNOWN")))
+
+# Replace "U" factors in VIC_SEX and PERP_SEX with NA
+shootings_clean <- shootings_clean %>%
+  mutate(
+    PERP_SEX = na_if(PERP_SEX, "U"),
+    VIC_SEX = na_if(VIC_SEX, "U")
+  )
+```
+
+I also want to make a few simple string manipulations to optimize the readability of our visualizations.
+
+```{r STRING_MANIPULATIONS, message=FALSE, warning=FALSE}
+# Rename Latitude and Longitude to uppercase for consistency
+shootings_clean <- shootings_clean %>%
+  rename(
+    LATITUDE = Latitude,
+    LONGITUDE = Longitude
+  )
+
+# Simplify racial group names for improved presentation
+race_recode <- c(
+  "WHITE HISPANIC" = "HISPANIC",
+  "BLACK HISPANIC" = "HISPANIC",
+  "ASIAN / PACIFIC ISLANDER" = "AAPI",
+  "AMERICAN INDIAN/ALASKAN NATIVE" = "NATIVE AMERICAN"
+)
+
+# Apply changes to both PERP_RACE and VIC_RACE
+shootings_clean <- shootings_clean %>%
+  mutate(
+    PERP_RACE = recode(PERP_RACE, !!!race_recode),
+    VIC_RACE = recode(VIC_RACE, !!!race_recode)
+  )
+```
+
+At this point, no further string manipulation is required so we can convert the `chr` features to more suitable data types.
+
+```{r CONVERT_FEATURES, message=FALSE, warning=FALSE}
+# Convert character features
+shootings_clean <- shootings_clean %>%
+  mutate(OCCUR_DATE = mdy(OCCUR_DATE),
+         BORO = as.factor(BORO),
+         PERP_AGE_GROUP = as.factor(PERP_AGE_GROUP),
+         PERP_SEX = as.factor(PERP_SEX),
+         PERP_RACE = as.factor(PERP_RACE),
+         VIC_AGE_GROUP = as.factor(VIC_AGE_GROUP),
+         VIC_SEX = as.factor(VIC_SEX),
+         VIC_RACE = as.factor(VIC_RACE)
+  )
+
+# Rename STATISTICAL_MURDER_FLAG to FATAL and convert to factor
+shootings_clean <- shootings_clean %>%
+  rename(FATAL = STATISTICAL_MURDER_FLAG) %>%
+  mutate(FATAL = factor(FATAL, levels = c(FALSE, TRUE))
+  )
+```
+
+I also want to create some new features.
+
+```{r NEW_FEATURES, message=FALSE, warning=FALSE}
+# Use OCCUR_TIME to create a new feature called HOUR
+shootings_clean <- shootings_clean %>%
+  mutate(HOUR = (hour(OCCUR_TIME)))
+
+# Use OCCUR_DATE to YEAR and MONTH features
+shootings_clean <- shootings_clean %>%
+  mutate(YEAR = factor(year(OCCUR_DATE)),
+         MONTH = factor(month(OCCUR_DATE, label = TRUE)),
+         DAY = factor(wday(OCCUR_DATE, label = TRUE, abbr = TRUE))
+  )
+```
+
+Finally, we can remove the features that will not play a role in this report moving forward. Note, I am removing all features related to the perpetrators due to an overwhelming number of NA values in the dataset. Chances are, this data is missing because most of the perpetrators were never apprehended, but this is only an assumption and I have no evidence to back up this claim.
+
+```{r REMOVE_FEATURES, message=FALSE, warning=FALSE}
+# Delete unnecessary features
+shootings_clean <- shootings_clean %>%
+  select(-c(LOC_OF_OCCUR_DESC, JURISDICTION_CODE, LOC_CLASSFCTN_DESC, LOCATION_DESC, 
+            X_COORD_CD, Y_COORD_CD, Lon_Lat, PERP_AGE_GROUP, PERP_RACE, PERP_SEX)
+  )
+```
+
+Now, if we call `summary()` we can see that the data has been successfully modified. There are a very small number of NA values remaining in features related to victims but they should not impede our analysis and we can always remove them later.
+
+```{r INSPECT_MODIFIED, message=FALSE, warning=FALSE}
+# Inspect modified dataframe
+summary(shootings_clean)
+```
+
+## Visualize Data
+
+#### **Question 1: What is the overall trend of shooting incidents?**
+
+The total number of shootings shows a general decline from 2006 to 2017 followed by a significant increase in 2020 and 2021, before dropping again. The recent surge coincides with the impact of the COVID-19 pandemic, social unrest, and changes in policing strategies. In just three years, the lowest (754 in 2018) and highest (1,562 in 2021) amounts of shootings were recorded.
+
+```{r VISUALIZE_YEARS, message=FALSE, warning=FALSE}
+# Visualize number of shooting incidents by year
+shootings_clean %>%
+  ggplot(aes(x = YEAR, fill = FATAL)) +
+  geom_bar(position = "stack") +
+  scale_fill_manual(values = c("FALSE" = "lightblue", "TRUE" = "lightcoral")) +
+  labs(title = "Shooting Incidents by Year",
+       x = "Years",
+       y = "Total Number of Shootings",
+       fill = "Fatal") +
+  geom_text(stat = 'count', aes(label = ..count..), vjust = 1.5, 
+            col = 'white', size = 3) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Although the total number of shootings per year fluctuates, it is interesting to note that the proportion of fatal incidents is more or less consistent. We can visualize these trends using regression analysis:
+
+```{r REGRESSION, message=FALSE, warning=FALSE}
+# Summarize data by year for total shootings
+annual_shootings <- shootings_clean %>%
+  group_by(YEAR) %>%
+  summarise(total_count = n())
+
+# Summarize data by year for fatal shootings
+annual_fatal_shootings <- shootings_clean %>%
+  filter(FATAL == TRUE) %>%
+  group_by(YEAR) %>%
+  summarise(fatal_count = n())
+
+# Summarize data by year for non-fatal shootings
+annual_non_fatal_shootings <- shootings_clean %>%
+  filter(FATAL == FALSE) %>%
+  group_by(YEAR) %>%
+  summarise(non_fatal_count = n())
+
+# Convert YEAR to numeric for plotting
+annual_shootings$YEAR <- as.numeric(as.character(annual_shootings$YEAR))
+annual_fatal_shootings$YEAR <- as.numeric(as.character(annual_fatal_shootings$YEAR))
+annual_non_fatal_shootings$YEAR <- as.numeric(as.character(annual_non_fatal_shootings$YEAR))
+
+# Fit linear models
+model_total <- lm(total_count ~ YEAR, data = annual_shootings)
+model_fatal <- lm(fatal_count ~ YEAR, data = annual_fatal_shootings)
+model_non_fatal <- lm(non_fatal_count ~ YEAR, data = annual_non_fatal_shootings)
+
+# Combine datasets for plotting
+combined_data <- bind_rows(
+  annual_shootings %>% rename(count = total_count) %>% mutate(type = "Total Shootings"),
+  annual_fatal_shootings %>% rename(count = fatal_count) %>% mutate(type = "Fatal Shootings"),
+  annual_non_fatal_shootings %>% rename(count = non_fatal_count) %>% mutate(type = "Non-Fatal Shootings")
+)
+
+# Plot data with regression lines
+ggplot(combined_data, aes(x = YEAR, y = count, color = type, fill = type)) +
+  geom_line(size = 1, linetype = "dashed") +
+  geom_smooth(method = "lm", se = TRUE, alpha = 0.3) +
+  labs(title = "Trends in Total, Fatal, and Non-Fatal Shootings",
+       x = "Year",
+       y = "Number of Shootings",
+       color = "Type of Shooting",
+       fill = "Type of Shooting") +
+  scale_color_manual(values = c("Total Shootings" = "darkred", "Fatal Shootings" = "darkblue", "Non-Fatal Shootings" = "darkgreen")) +
+  scale_fill_manual(values = c("Total Shootings" = "lightcoral", "Fatal Shootings" = "lightblue", "Non-Fatal Shootings" = "lightgreen")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Print summary of total shootings model
+summary(model_total)
+
+# Print summary of fatal shootings model
+summary(model_fatal)
+
+# Print summary of non-fatal shootings model
+summary(model_non_fatal)
+```
+
+The regression analysis confirms a statistically significant decrease in shootings, with total incidents reducing by approximately 26 per year. While fatal shootings also show a downward trend, their rate of decline is smaller, at roughly five incidents per year. This suggests that non-fatal shootings are the primary driver of the overall decreasing trend, as they are declining at a rate of around 21 per year.
+
+#### **Question 2: How are shootings distributed across the Five Boroughs?**
+
+Brooklyn recorded the most shooting incidents overall (9,144), by some measure, followed by The Bronx (6,335). Combined, these two boroughs account for roughly two-thirds of all reported cases with Queens (3,360) and Manhattan (2,909) reporting relatively similar numbers. Staten Island (646) recorded the fewest incidents, with less than 1,000 - this is in stark contrast to the almost 10,000 shootings reported in Brooklyn.
+
+```{r VISUALIZE_BORO, message=FALSE, warning=FALSE}
+# Visualize shootings by borough
+shootings_clean %>%
+  ggplot(aes(x = BORO, fill = BORO)) +
+  geom_bar() +
+  geom_text(stat = 'count', aes(label = ..count..), 
+            vjust = 1.5, col = 'white', size = 3) +
+  labs(title = "Shooting Incidents by Borough",
+       fill = "Borough",
+       x = "NYC Boroughs",
+       y = "Total Number of Shootings")
+```
+
+However, if we look at the incidence rate per 100,000 residents, The Bronx has the highest number of shootings per capita, and Manhattan overtakes Queens in this metric.
+
+```{r POPULATION, message=FALSE, warning=FALSE}
+population <- read_csv("https://data.cityofnewyork.us/resource/xywu-7bv9.csv")
+population_2020 <- population %>%
+  filter(borough != "NYC Total") %>%
+  select(borough, `_2020`) %>%
+  rename(BORO = borough, Population = `_2020`) %>%
+  mutate(BORO = toupper(BORO))
+
+shootings_by_boro <- shootings_clean %>%
+  group_by(BORO) %>%
+  summarise(Total_Shootings = n())
+
+shootings_population <- shootings_by_boro %>%
+  left_join(population_2020, by = "BORO") %>%
+  mutate(Rate_Per_100k = (Total_Shootings / Population) * 100000)
+
+ggplot(shootings_population, aes(x = BORO, y = Rate_Per_100k, fill = BORO)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = round(Rate_Per_100k, 1)),
+            vjust = 1.5, col = 'white', size = 3) +
+  labs(title = "Shooting Incidents by Borough (Per 100K Residents)",
+       fill = "Borough",
+       x = "NYC Boroughs",
+       y = "Incidence Rate") +
+  theme_minimal()
+```
+
+In addition, Staten Island actually has the highest proportion of fatal shootings, if only by a very small margin:
+
+```{r MURDER_PROPORTIONS, message=FALSE, warning=FALSE}
+# Calculate number of fatal and non-fatal shootings in each borough
+shooting_counts <- shootings_clean %>%
+  group_by(BORO, FATAL) %>%
+  summarise(count = n()) %>%
+  spread(FATAL, count, fill = 0) %>%
+  rename(fatal_count = `TRUE`, non_fatal_count = `FALSE`)
+
+# Calculate total shootings and proportions
+shooting_proportions <- shooting_counts %>%
+  mutate(total = fatal_count + non_fatal_count,
+         fatal_proportion = fatal_count / total,
+         non_fatal_proportion = non_fatal_count / total)
+
+# Select and display relevant columns
+shooting_proportions %>%
+  select(BORO, fatal_count, non_fatal_count, fatal_proportion, non_fatal_proportion)
+```
+
+We can also inspect the `PRECINCT` feature to drill a little deeper and identify the specific neighborhoods that recorded the most shooting incidents. To do this we can pull in the latest census tracts from [NYC OpenData](https://data.cityofnewyork.us/City-Government/2020-Census-Tracts/63ge-mke6/about_data) and perform spatial analysis.
+
+```{r TOP_PRECINCTS, message=FALSE, warning=FALSE}
+# Load census tract data and convert to spatial data frame
+census_tract <- read_csv("https://data.cityofnewyork.us/api/views/63ge-mke6/rows.csv?accessType=DOWNLOAD")
+census_tract_sf <- st_as_sf(census_tract, wkt = "the_geom", crs = 4326)
+
+# Identify top ten precincts with most shootings
+top_10_precincts <- shootings_clean %>%
+  group_by(PRECINCT, BORO) %>%
+  summarise(shooting_count = n(), .groups = 'drop') %>%
+  arrange(desc(shooting_count)) %>%
+  slice_head(n = 10)
+
+# Print top ten precincts
+print(top_10_precincts)
+
+# Filter shootings data to include only incidents in top ten precincts
+top_10_shootings <- shootings_clean %>%
+  filter(PRECINCT %in% top_10_precincts$PRECINCT) %>%
+  filter(!is.na(LONGITUDE) & !is.na(LATITUDE))
+
+# Convert filtered shootings data to spatial data frame
+top_10_shootings_sf <- st_as_sf(top_10_shootings, coords = c("LONGITUDE", "LATITUDE"), 
+                                crs = 4326, agr = "constant")
+
+# Plot top ten precincts with most shootings on a map
+ggplot() +
+  geom_sf(data = census_tract_sf, fill = "lightgrey", color = "white") +
+  geom_sf(data = top_10_shootings_sf, color = "steelblue", size = 1, alpha = 0.4) +
+  labs(title = "Top Ten Precincts with Most Shootings in NYC") +
+  theme_minimal()
+```
+
+By looking more closely at the data we can see that almost 40% of the reported shootings in Brooklyn happened in just four precincts, and this proportion jumps to almost 50% for The Bronx. This shows that incidents are highly concentrated within specific neighborhoods. 
+
+#### **Question 3: When did most shootings take place?**
+
+Shooting incidents exhibit clear temporal patterns, peaking during summer months (June, July, and August) and declining in winter. This seasonal trend may be influenced by factors like weather, holidays, and social activities.
+
+```{r MONTH, message=FALSE, warning=FALSE}
+# Group dataset by month and summarize number of incidents
+monthly_incidents <- shootings_clean %>%
+  group_by(MONTH) %>%
+  summarise(INCIDENTS = n()) %>%
+  mutate(Month_Num = as.numeric(MONTH))
+
+# Fit quadratic model to number of incidents by month
+quadratic_model_month <- lm(INCIDENTS ~ poly(Month_Num, 2), data = monthly_incidents)
+summary(quadratic_model_month)
+
+# Plot distribution of shootings by month
+ggplot(monthly_incidents, aes(x = Month_Num, y = INCIDENTS)) +
+  geom_bar(stat = "identity", fill = "steelblue", alpha = 0.7) +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = "darkred") +
+  scale_x_continuous(breaks = 1:12, labels = levels(monthly_incidents$MONTH)) +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Shootings by Month",
+    x = "Month",
+    y = "Number of Incidents")
+```
+
+Shootings are most frequent during late night and early morning hours, particularly around 11pm to 1am, with a decrease from 5:00 to 8:00, followed by a gradual increase throughout the day.
+
+```{r TIME_OF_DAY, message=FALSE, warning=FALSE}
+# Group dataset by hour day and summarize number of incidents
+hourly_incidents <- shootings_clean %>%
+  group_by(HOUR) %>%
+  summarize(INCIDENTS = n())
+
+# Plot number of shooting incidents by time of day
+ggplot(hourly_incidents, aes(x = HOUR, y = INCIDENTS)) +
+  geom_line(size = 1.2, color = "steelblue", alpha = 0.4) +
+  geom_point(fill = "white", size = 2, stroke = 1.5, shape = 21) +
+  labs(title = "Shooting Incidents by Time of Day",
+       x = "Hour",
+       y = "Total Number of Shootings") +
+  scale_x_continuous(
+    breaks = 0:23,
+    labels = function(x) sprintf("%02d:00", x)
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Incidents typically peak on weekends, with a noticeable dip midweek, especially on Wednesday and Thursday.
+
+```{r DAY_OF_WEEK, message=FALSE, warning=FALSE}
+# Group dataset by day of the week and summarize the number of incidents
+daily_incidents <- shootings_clean %>%
+  group_by(DAY) %>%
+  summarise(Incidents = n()) %>%
+  mutate(Day_Num = as.numeric(DAY))
+
+# Fit a quadratic model to number of incidents by day
+quadratic_model <- lm(Incidents ~ poly(Day_Num, 2), data = daily_incidents)
+
+# Plot distribution of shootings by day of the week
+ggplot(daily_incidents, aes(x = Day_Num, y = Incidents)) +
+  geom_bar(stat = "identity", fill = "lightgreen", alpha = 0.7) +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = "purple") +
+  scale_x_continuous(breaks = 1:7, labels = levels(daily_incidents$DAY)) +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Shootings by Day",
+    x = "Day of the Week",
+    y = "Number of Incidents")
+```
+
+In summary, shootings are most likely in summer, late at night, and on weekends. These patterns suggest a link to increased outdoor activities, nightlife, and social dynamics. Understanding these trends can help law enforcement and community programs focus resources and preventive measures during peak times to effectively reduce shootings.
+
+#### **Question 4: What can we learn about the people killed in these incidents?**
+
+The dataset includes demographic features that allow us to explore the age, race, and sex dynamics of the shooting incidents. So with this in mind, let's build up a profile of a "typical" murder victim. 
+
+```{r MURDER_CASE, message=FALSE, warning=FALSE}
+# Filter dataset for murder cases
+murder_cases <- shootings_clean %>%
+  filter(FATAL == "TRUE")
+
+# Create summary table of victim profiles
+victim_profile_table <- murder_cases %>%
+  group_by(VIC_AGE_GROUP, VIC_SEX, VIC_RACE) %>%
+  summarise(Incident_Count = n(), .groups = 'drop') %>%  
+  arrange(desc(Incident_Count))
+
+# Print victim profile table to view summary
+print(victim_profile_table)
+```
+
+The data clearly indicates that most murder victims are young Black men aged between 18 and 44. This can be visualized as a simple treemap.
+
+```{r TREEMAP, message=FALSE, warning=FALSE}
+ggplot(victim_profile_table,
+       aes(area = Incident_Count,
+           fill = VIC_RACE,
+           label = paste(VIC_AGE_GROUP, VIC_SEX, VIC_RACE, sep = "\n"))) +
+  geom_treemap() +
+  geom_treemap_text(colour = "white",
+                    place = "centre",
+                    size = 10) +
+  scale_fill_viridis_d() + # Using a visually appealing color palette
+  labs(title = "Distribution of Shooting Incidents by Victim Profile",
+       fill = "Victim Race") +
+  theme(legend.position = "bottom")
+```
+
+#### **Question 5: Will fatal shootings increase or decrease over the next ten years?**
+
+We know exactly when each shooting took place over an 18 year period. With so much temporal data at our fingerprints, we can use time series forecasting to predict the expected trajectory of fatal shootings. This type of analysis is critical for public safety planning and law enforcement, and could help to shape intervention strategies and policies.
+
+```{r ARIMA_MODEL, message=FALSE, warning=FALSE}
+# Group data by month and summarize number of fatal shootings
+murder_cases <- shootings_clean %>%
+  group_by(YearMonth = floor_date(OCCUR_DATE, "month")) %>%
+  summarize(Murders = sum(FATAL == "TRUE", na.rm = TRUE)) %>%
+  ungroup()
+
+# Plot monthly fatal shootings with a trend line
+ggplot(murder_cases, aes(x = YearMonth, y = Murders)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), color = "plum", 
+              se = FALSE) +
+  labs(title = "Monthly Fatal Shootings",
+       x = "Year-Month",
+       y = "Number of Fatal Shootings") +
+  theme_minimal() +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "1 year") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Convert summarized data into a time series object
+murders_ts <- ts(murder_cases$Murders, 
+                 start = c(year(min(murder_cases$YearMonth)), 
+                           month(min(murder_cases$YearMonth))), 
+                 frequency = 12)
+
+# Decompose time series to analyze its components
+ddata <- decompose(murders_ts, "multiplicative")
+plot(ddata)
+
+# Fit model to time series data
+model <- auto.arima(murders_ts)
+print(model)
+
+# Plot residuals of model to check for patterns
+plot.ts(model$residuals)
+
+# Forecast next 10 years with 95% confidence intervals
+forecasted <- forecast(model, level = c(95), h = 10*12)
+plot(forecasted, main = "10-Year Forecast of Fatal Shootings in NYC")
+
+# Perform Ljung-Box test on residuals to check for autocorrelation
+Box.test(model$resid, lag = 5, type = "Ljung-Box")
+Box.test(model$resid, lag = 10, type = "Ljung-Box")
+Box.test(model$resid, lag = 15, type = "Ljung-Box")
+```
+
+The Autoregressive integrated moving average (ARIMA) model forecasts that the number of shooting-related fatalities in NYC is expected to remain stable or slightly decrease over the next decade. The model's coefficients and fit, including a sigma^2 of 31.65 and a log likelihood of -672.91, indicate a well-fitted model, with AIC, AICc, and BIC values supporting its quality. Residual analysis through the Box-Ljung test shows p-values above 0.76, suggesting that the residuals are not significantly different from white noise, indicating effective pattern capture.
+
+The forecasted trajectory, with stable central forecast lines and confidence intervals, suggests a low likelihood of a significant increase in fatalities. Although the confidence levels widen, reflecting long-term prediction uncertainty, the overall outlook remains positive. This stability provides valuable insights for strategic planning and resource allocation by the NYPD, emphasizing the importance of maintaining current efforts to ensure that the projected stability is realized. In summary, no significant increase in fatalities is anticipated, offering a positive outlook for future trends.
+
+#### **Question 6: What is the likelihood that a shooting is fatal?**
+
+To address this question we can employ statistical models to predict the fatality of shooting incidents in New York City. By considering various demographic and temporal features, such as borough, age group, sex, race, time of occurrence, and year, we can try to assess their impact on the likelihood of an incident being fatal. A quick baseline analysis reveals that approximately 21% of all shooting incidents resulted in a fatality.
+
+```{r TOTAL_MURDERS, message=FALSE, warning=FALSE}
+# Display breakdown of fatal shootings
+table(shootings_clean$FATAL)
+```
+
+Initially, a Generalized Linear Model (GLM) was used to predict fatal shootings. The GLM achieved a high accuracy with perfect sensitivity, meaning it correctly identified all "FALSE" cases. However, this high sensitivity came at the cost of specificity, which was extremely low, indicating a significant bias towards predicting the majority class ("FALSE"). The low Kappa statistic suggests that the model's predictions were only slightly better than random choice, highlighting its inability to effectively capture the minority class. This underscored the need for more advanced models that can better handle class imbalance and capture complex relationships.
+
+```{r GLM_MODEL, message=FALSE, warning=FALSE}
+# Filter out unnecessary features
+dataset <- shootings_clean %>%
+  select(-c(INCIDENT_KEY, LATITUDE, LONGITUDE, HOUR, HOUR, YEAR, MONTH, DAY)) %>%
+  na.omit()
+
+# Split data into training and testing sets
+train_indices <- createDataPartition(y = dataset$FATAL, p = 0.8, list = FALSE)
+train_data <- dataset[train_indices, ]
+test_data <- dataset[-train_indices, ]
+
+# Fit Generalized Linear Model
+model <- train(FATAL ~., data = train_data, method = "glm", 
+               trControl = trainControl(method = "cv", number = 3), 
+               family = "binomial")
+
+# Display model summary
+summary(model)
+
+# Make predictions on test set
+preds <- predict(model, newdata = test_data)
+
+# Evaluate model
+confusion_matrix <- confusionMatrix(preds, test_data$FATAL)
+print(confusion_matrix)
+
+# Calculate accuracy
+accuracy <- sum(diag(confusion_matrix$table)) / sum(confusion_matrix$table)
+print(paste("Accuracy:", round(accuracy, 2)))
+```
+
+Subsequently, a Random Forest model was employed, offering a more balanced approach. The Random Forest model had a lower accuracy compared to the GLM, with a much lower sensitivity, indicating moderate effectiveness in identifying "FALSE" cases. Its specificity was considerably higher than the GLM, showing improved ability to identify "TRUE" cases, though still not optimal. The Kappa statistic was slightly higher, indicating better agreement between predicted and actual classifications. The Random Forest model provided a more balanced prediction between the two classes, though there was still room for improvement.
+
+```{r RANDOM_FOREST, message=FALSE, warning=FALSE}
+# Filter out unnecessary features
+dataset <- shootings_clean %>%
+  select(-c(INCIDENT_KEY, LATITUDE, LONGITUDE, OCCUR_DATE, OCCUR_TIME)) %>%
+  na.omit()
+
+# Convert FATAL to a factor with correct levels
+dataset$FATAL <- factor(dataset$FATAL, levels = c("FALSE", "TRUE"))
+
+# Check class distribution
+class_distribution <- table(dataset$FATAL)
+
+# One-hot encode categorical variables
+dataset_numeric <- dummy_cols(dataset, 
+                              select_columns = c("BORO", "PRECINCT", "VIC_AGE_GROUP", 
+                                                 "VIC_SEX", "VIC_RACE", "HOUR",
+                                                 "YEAR", "MONTH", "DAY"), 
+                              remove_first_dummy = TRUE, 
+                              remove_selected_columns = TRUE)
+
+# Handle missing values by removing rows with missing values
+dataset_numeric <- na.omit(dataset_numeric)
+
+# Undersample majority class
+majority_class <- dataset_numeric[dataset_numeric$FATAL == "FALSE", ]
+minority_class <- dataset_numeric[dataset_numeric$FATAL == "TRUE", ]
+
+# Combine undersampled majority class with minority class
+if (nrow(minority_class) > 0) {
+  majority_class_sample <- majority_class[sample(nrow(majority_class), 
+                                                 nrow(minority_class)), ]
+  dataset_balanced <- rbind(majority_class_sample, minority_class)
+} else {
+  stop("Minority class is empty or has very few records.")
+}
+
+# Ensure dataset is not empty
+if (nrow(dataset_balanced) == 0) {
+  stop("Balanced dataset is empty.")
+}
+
+# Split data into training and testing sets
+train_indices <- createDataPartition(y = dataset_balanced$FATAL, 
+                                     p = 0.8, list = FALSE)
+train_data <- dataset_balanced[train_indices, ]
+test_data <- dataset_balanced[-train_indices, ]
+
+# Proceed with model training if no missing values
+if (sum(is.na(train_data)) == 0 && sum(is.na(test_data)) == 0) {
+  tune_grid <- expand.grid(.mtry = c(2, 3, 4))
+  rf_tuned_model <- train(FATAL ~ ., data = train_data, method = "rf", 
+                          trControl = trainControl(method = "cv", number = 3), 
+                          tuneGrid = tune_grid)
+  rf_tuned_preds <- predict(rf_tuned_model, newdata = test_data)
+  rf_tuned_confusion_matrix <- confusionMatrix(rf_tuned_preds, test_data$FATAL)
+  print(rf_tuned_confusion_matrix)
+} else {
+  stop("Missing values detected in train or test data.")
+}
+```
+
+In conclusion, while the Random Forest model offers a more balanced approach than the GLM, its overall performance suggests that further tuning, feature engineering, or exploration of different algorithms could enhance its effectiveness. At this point, we cannot confidently answer the question regarding the likelihood of a shooting being fatal due to the models' sub-optimal performance. However, this analysis has certainly highlighted the importance of using advanced models that can handle class imbalance and capture complex interactions effectively, suggesting that further experimentation is advisable.
+
+## Conclusions
+
+In this report, I have attempted to provide a comprehensive analysis of the NYPD Shooting Incident Data (Historic) dataset. Through my analysis, I have been able to draw the following conclusions:
+
+1. **Geographic Disparities:** The data reveals significant geographic disparities in shooting incidents across New York City. Brooklyn and The Bronx are the most affected boroughs, accounting for the majority of incidents. This suggests a need for targeted interventions in these areas to address the underlying causes of gun violence.
+2. **Temporal Trends:** There is a clear temporal pattern in shooting incidents, with a general decline from 2006 to 2017, followed by a sharp increase from 2020 to 2022. This recent surge may be linked to external factors such as the COVID-19 pandemic and social unrest, highlighting the importance of understanding and addressing these influences. The data shows that the number of shootings is trending downwards overall, and this is being driven primarily by a decrease in the number of non-fatal incidents.
+3. **Seasonal & Daily Patterns:** Shooting incidents peak during the summer months and late-night hours, indicating potential correlations with increased social activities and gatherings, as well as the "cover" of darkness. This information can be used to inform policing strategies and community outreach efforts during high-risk periods.
+4. **Demographic Insights:** Black males aged 18-44 are statistically the most likely people to be the victims of gun violence. These findings underscore the need for community-based interventions that address the specific needs and challenges faced by this demographic group.
+5. **Data Limitations:** A significant amount of missing data, particularly regarding perpetrator information, poses challenges to the analysis. Efforts to improve data collection and reporting practices are essential for more accurate and comprehensive insights.
+6. **Statistical Modeling:** This report employed both time series forecasting and predictive modeling to assess shooting incidents. The time series analysis forecasts that the number of shooting-related fatalities is expected to remain stable or slightly decrease over the next decade. However, I was unable to reliably predict if a shooting is likely to be fatal or not. It appears that far more advanced modeling is required to generate meaningful predictions.
+
+Overall, this analysis highlights the complex interplay of geographic, temporal, and demographic factors in gun violence in New York City. It underscores the importance of data-driven approaches to inform policy decisions and intervention strategies aimed at reducing shooting incidents and improving public safety.
+
+## **Addressing Potential Biases**
+
+There are many potential biases that could impact our analysis of this dataset:
+
+- **Data Collection Bias:** The data is manually extracted and reviewed, which could introduce human error or subjective judgment in what is recorded or how it is categorized.
+- **Reporting Bias:** Not all shooting incidents may be reported or recorded, especially if they occur in areas with lower police presence or if victims or witnesses are unwilling to report incidents due to fear of retaliation or distrust in law enforcement.
+- **Demographic Bias:** The dataset includes demographic information about suspects and victims, which could reflect or reinforce societal biases. For example, certain racial or age groups might be over-represented due to systemic issues in policing or reporting.
+- **Location Bias:** The data might be skewed towards certain boroughs or neighborhoods where there is a higher police presence or more active reporting, potentially under-representing incidents in other areas.
+- **Temporal Bias:** The dataset covers incidents from 2006 to the end of the previous calendar year, but changes in policing practices, crime rates, or societal factors over time could affect the data. Additionally, the quarterly extraction might miss nuances in trends or patterns.
+- **Classification Bias:** The way incidents are classified (e.g., "STREET" vs. "PVT HOUSE") might not capture the full context or might be inconsistent, affecting analysis of location-based trends.
+- **Missing Data:** There are many missing values in fields like perpetrator age, sex, and race, which could lead to incomplete or skewed analyses if not properly addressed.
+- **Jurisdictional Bias:** The dataset includes a "JURISDICTION_CODE" which might affect how incidents are recorded or responded to, potentially introducing bias based on jurisdictional boundaries or policies.
+- **Statistical Murder Flag:** The "STATISTICAL_MURDER_FLAG" might not accurately reflect the legal outcome or context of the incident, leading to potential misinterpretation of the severity or nature of incidents.
+- **Spatial Bias:** The use of coordinates and geographic data might introduce bias if there are inaccuracies in geo-coding or if certain areas are more densely populated, affecting the perceived concentration of incidents.
+
+Addressing these biases requires careful consideration of the dataset's limitations, potential confounding factors, and the context in which the data was collected and recorded.
+
+## Session Info
+
+```{r SESSION_INFO, message=FALSE, warning=FALSE}
+# Display R session information
+sessionInfo()
+```
