@@ -22,6 +22,9 @@ library(treemapify)
 library(forecast)
 library(fastDummies)
 library(randomForest)
+
+# Set seed for reproducibility
+set.seed(123)
 ```
 
 ## Introduction
@@ -38,30 +41,6 @@ This report aims to answer the following questions:
 4. What can we learn about the people killed in these incidents?
 5. Will fatal shootings increase or decrease over the next ten years?
 6. What is the likelihood that a shooting is fatal?
-
-### Environment Setup
-
-To begin, let's import the various packages that we will need to conduct our analysis, and set a seed value so that our models are reproducible.
-
-```{r ENV_SETUP, message=FALSE, warning=FALSE}
-# Import required libraries
-library(tidyverse)
-library(lubridate)
-library(ggplot2)
-library(dplyr)
-library(hms)
-library(caret)
-library(sf)
-library(viridis)
-library(knitr)
-library(wordcloud)
-library(forecast)
-library(fastDummies)
-library(randomForest)
-
-# Set seed for reproducibility
-set.seed(123)
-```
 
 ## Load Data
 
