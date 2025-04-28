@@ -1,5 +1,5 @@
 ---
-title: "DTSA 5301 - Analysis of NYC Shooting Incidents"
+title: "DTSA 5301 - Analysis of NYPD Shooting Incident Data"
 author: "Matthew Dutton"
 date: "`r Sys.Date()`"
 output: 
